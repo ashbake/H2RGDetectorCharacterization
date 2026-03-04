@@ -1,0 +1,54 @@
+%YAML 1.2
+---
+
+class: ProcessDarksPipeline
+
+primitives:
+  dq_init:
+    arguments:
+      run: False
+  make_bias:
+    arguments:
+      run: True
+  register_bias_cal:
+    arguments:
+      run: False
+  saturation_check:
+    arguments:
+      run: False
+  bias_sub:
+    arguments:
+      run: False
+  nonlin_corr:
+    arguments:
+      run: False
+  jump_detec:
+    arguments:
+      run: False
+  make_run:
+    arguments:
+      run: False
+  register_rn_cal:
+    arguments:
+      run: False
+  ramp_fit:
+    arguments:
+      run: False
+  coadd:
+    arguments:
+      run: False
+  make_dark:
+    arguments:
+      run: False
+  register_dark_cal:
+    arguments:
+      run: False
+  dark_sub:
+    arguments:
+      run: False
+  bias_sub:
+    arguments:
+      run: False
+  detflat_corr:
+    arguments:
+      run: False
