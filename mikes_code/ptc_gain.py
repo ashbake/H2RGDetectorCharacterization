@@ -27,12 +27,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import os
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from numpy.polynomial import Polynomial
 from scipy.interpolate import interp1d
 from scipy.optimize import least_squares
+
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +369,10 @@ def compute_ptc(
     )
     _plot_raw_ptc(bias_sub_mean, per_read_std, all_means, all_vars, fit_params, plot_max_mean_dn)
 
-    _plot_linearisation(result,f_inv,fit_max_mean_dn)
+    _plot_linearisation(result,
+                        f_inv,
+                        fit_max_mean_dn,
+                        save_path)
 
     return result
 
@@ -382,7 +387,10 @@ def _ptc_model(params: np.ndarray, x: np.ndarray) -> np.ndarray:
     return slope * x + intercept
 
 
-def _plot_linearisation(result: PTCResult, f_inv, fit_max_mean_dn) -> None:
+def _plot_linearisation(result: PTCResult, 
+                        f_inv: interp1d, 
+                        fit_max_mean_dn: np.float,
+                        save_path: str) -> None:
     """
     Visualise the linearity correction for a sample of pixels.
 
@@ -477,6 +485,12 @@ def _plot_linearisation(result: PTCResult, f_inv, fit_max_mean_dn) -> None:
     plt.tight_layout()
     plt.show()
 
+    if save_path is not None:
+        os.makedirs(save_path, exist_ok=True)
+        fig.savefig(save_path + 'linearisation.png', dpi=150)
+        print(f"Figure saved to {save_path}")
+
+
 
 def _plot_ptc_histogram(
     result: PTCResult,
@@ -559,8 +573,10 @@ def _plot_ptc_histogram(
     plt.tight_layout()
     plt.show()
     if save_path is not None:
-        fig.savefig(save_path, dpi=150)
+        os.makedirs(save_path, exist_ok=True)
+        fig.savefig(save_path + 'ptc_fit.png', dpi=150)
         print(f"Figure saved to {save_path}")
+
 
 
 def _plot_raw_ptc(
