@@ -91,6 +91,7 @@ def _build_linearity_corrector(
     expected_signal: np.ndarray,
     observed_mean: np.ndarray,
     observed_std: np.ndarray,
+    fit_min_mean_dn: np.float,
     fit_max_mean_dn: np.float,
     poly_degree: int,
 ) -> tuple[interp1d, Polynomial]:
@@ -119,7 +120,10 @@ def _build_linearity_corrector(
     poly : Polynomial
         Forward polynomial: poly(linear_signal) → observed_DN.
     """
-    in_range = np.where(observed_mean < fit_max_mean_dn)[0]
+    in_range = np.where((observed_mean < fit_max_mean_dn) & (observed_mean > fit_min_mean_dn))[0]
+    if len(in_range)<2:
+        raise Warning('You excluded too many points from the linearity fit.')
+    
     weights = 1.0 / np.clip(observed_std[in_range], 1e-6, None)  # avoid /0
     poly = Polynomial.fit(expected_signal[in_range], observed_mean[in_range], deg=poly_degree, w=weights)
 
@@ -131,34 +135,6 @@ def _build_linearity_corrector(
                     fill_value="extrapolate")
     return f_inv, poly
 
-
-def _linearise_pixel(
-    raw_stack: np.ndarray,
-    bias_level: float,
-    f_inv: interp1d,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Apply linearity correction to all exposures of one pixel.
-
-    Parameters
-    ----------
-    raw_stack : 2-D array, shape (n_exposures, n_reads)
-        Raw DN values for one pixel across all exposures and reads.
-    bias_level : float
-        Mean bias (zeroth-read level) to subtract before correction.
-    f_inv : callable
-        Inverse linearity map from `_build_linearity_corrector`.
-
-    Returns
-    -------
-    mean_per_read : 1-D array, shape (n_reads,)
-    var_per_read  : 1-D array, shape (n_reads,)
-    """
-    bias_corrected = raw_stack - bias_level          # subtract bias
-    linearised = f_inv(bias_corrected)               # undo non-linearity
-    mean_per_read = linearised.mean(axis=0)
-    var_per_read = linearised.std(axis=0) ** 2
-    return mean_per_read, var_per_read
 
 
 def _fit_ptc_line(
@@ -208,12 +184,13 @@ def _fit_ptc_line(
 
 def compute_ptc(
     images: np.ndarray,
+    correct_nonlinearity: bool=True,
     poly_degree: int = 4,
     fit_min_mean_dn: float=10_000,
     fit_min_var_dn2: float=100**2,
     fit_max_mean_dn: float = 25_000,
     fit_max_var_dn2: float = 350 ** 2,
-    plot_max_mean_dn: float = 25_000,
+    plot_max_mean_dn: float | None = None,
     plot_max_var_dn2: float | None = None,
     title: str | None = None,
     save_path: str | None = None,
@@ -228,9 +205,20 @@ def compute_ptc(
         Raw detector data.  n_exposures >= 2 (temporal variance requires
         at least two independent exposures per read level).
 
+    correct_nonlinearity : bool, default True
+        whether to correct nonlinearity or not by linearising the 
+        pixel values
+
     poly_degree : int, default 4
         Degree of the polynomial used to model and correct pixel
         non-linearity before PTC fitting.
+
+    fit_min_mean_dn : float, default 10 000
+        Lower signal limit [DN] included in the PTC linear fit.
+        Points below this value are excluded to avoid saturation effects.
+
+    fit_min_var_dn2 : float, default 100^2
+        Lower variance limit [DN^2] to include in the PTC linear fit.
 
     fit_max_mean_dn : float, default 25 000
         Upper signal limit [DN] included in the PTC linear fit.
@@ -239,8 +227,9 @@ def compute_ptc(
     fit_max_var_dn2 : float, default 122 500  (= 350^2)
         Upper variance limit [DN^2] included in the PTC linear fit.
 
-    plot_max_mean_dn : float, default 25 000
+    plot_max_mean_dn : float or None
         Upper signal limit [DN] shown in the 2-D histogram plot.
+        Defaults to ``fit_max_mean_dn`` when None.
 
     plot_max_var_dn2 : float or None
         Upper variance limit [DN^2] shown in the histogram.
@@ -280,6 +269,8 @@ def compute_ptc(
 
     if plot_max_var_dn2 is None:
         plot_max_var_dn2 = fit_max_var_dn2
+    if plot_max_mean_dn is None:
+        plot_max_mean_dn = fit_max_mean_dn
 
     n_exposures, n_reads, n_pixels = images.shape
 
@@ -292,10 +283,10 @@ def compute_ptc(
     #   bias  : average DN at the zeroth read (one value per pixel)
     #   flux  : mean DN deposited between read 1 and read 2 (proxy for rate)
     #   linear_model[read, pixel] = read_index x flux_rate
-    bias         = 0*per_read_mean[0, :]                      # (n_pixels,)
+    bias         = per_read_mean[0, :]                        # (n_pixels,)
     flux_rate    = per_read_mean[2, :] - per_read_mean[1, :]  # (n_pixels,)
     read_index   = np.arange(n_reads)                         # (n_reads,)
-    linear_model = read_index[:, np.newaxis] * flux_rate[np.newaxis, :] + per_read_mean[0, :]
+    linear_model = read_index[:, np.newaxis] * flux_rate[np.newaxis, :]
     # (n_reads, n_pixels)
 
     # Bias-subtracted observed mean for fitting the non-linearity polynomial
@@ -318,13 +309,19 @@ def compute_ptc(
             expected_signal = linear_model[:, pix],
             observed_mean   = bias_sub_mean[:, pix],
             observed_std    = per_read_std[:, pix],
+            fit_min_mean_dn = fit_min_mean_dn,
             fit_max_mean_dn = fit_max_mean_dn,
             poly_degree     = poly_degree,
         )
         raw_stack = images[:, :, pix]          # (n_exposures, n_reads)
-        mean_lin, var_lin = _linearise_pixel(raw_stack, bias[pix], f_inv)
-        all_means[pix] = mean_lin
-        all_vars[pix]  = var_lin
+        bias_corrected = raw_stack - bias[pix] # subtract bias
+        if correct_nonlinearity:
+            linearised = f_inv(bias_corrected)               # undo non-linearity
+            all_means[pix]  = linearised.mean(axis=0)
+            all_vars[pix]   = linearised.std(axis=0) ** 2
+        else:
+            all_means[pix]  = bias_corrected.mean(axis=0) # (npix)
+            all_vars[pix]   = bias_corrected.std(axis=0) ** 2
 
         # Save diagnostics for sampled pixels
         sample_pos = np.where(sample_idx == pix)[0]
@@ -371,6 +368,7 @@ def compute_ptc(
 
     _plot_linearisation(result,
                         f_inv,
+                        fit_min_mean_dn,
                         fit_max_mean_dn,
                         save_path)
 
@@ -389,6 +387,7 @@ def _ptc_model(params: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 def _plot_linearisation(result: PTCResult, 
                         f_inv: interp1d, 
+                        fit_min_mean_dn: np.float,
                         fit_max_mean_dn: np.float,
                         save_path: str) -> None:
     """
@@ -470,7 +469,8 @@ def _plot_linearisation(result: PTCResult,
         ax_bot.scatter(expected, corr_resid,
                        s=18, color="steelblue", zorder=3, marker="^",
                        label="Corrected residual")
-        ax_bot.axvline(fit_max_mean_dn,color='gray',label='Max DN to Fit')
+        ax_bot.axvline(fit_max_mean_dn,color='g',ls='--', label='Max DN to Fit')
+        ax_bot.axvline(fit_min_mean_dn,color='m',ls='--',label='Min DN to Fit')
         ax_bot.set_xlabel("Linear expectation [DN]")
         ax_bot.set_ylabel("Residual [%]")
         if s == 0:
