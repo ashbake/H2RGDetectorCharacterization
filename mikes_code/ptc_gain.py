@@ -305,18 +305,19 @@ def compute_ptc(
     lin_corrected = np.empty((n_sample, n_reads))  # corrected mean
 
     for pix in range(n_pixels):
-        f_inv, poly = _build_linearity_corrector(
-            expected_signal = linear_model[:, pix],
-            observed_mean   = bias_sub_mean[:, pix],
-            observed_std    = per_read_std[:, pix],
-            fit_min_mean_dn = fit_min_mean_dn,
-            fit_max_mean_dn = fit_max_mean_dn,
-            poly_degree     = poly_degree,
-        )
         raw_stack = images[:, :, pix]          # (n_exposures, n_reads)
-        bias_corrected = raw_stack - bias[pix] # subtract bias
-        if correct_nonlinearity:
-            linearised = f_inv(bias_corrected)               # undo non-linearity
+        bias_corrected = raw_stack - bias[pix] # subtract mean bias
+
+        if correct_nonlinearity: 
+            f_inv, poly = _build_linearity_corrector(
+                expected_signal = linear_model[:, pix],
+                observed_mean   = bias_sub_mean[:, pix],
+                observed_std    = per_read_std[:, pix],
+                fit_min_mean_dn = fit_min_mean_dn,
+                fit_max_mean_dn = fit_max_mean_dn,
+                poly_degree     = poly_degree,
+        )
+            linearised = f_inv(bias_corrected)           # apply non-linearity remapping
             all_means[pix]  = linearised.mean(axis=0)
             all_vars[pix]   = linearised.std(axis=0) ** 2
         else:
@@ -329,7 +330,7 @@ def compute_ptc(
             s = sample_pos[0]
             lin_expected[s]  = linear_model[:, pix]
             lin_observed[s]  = bias_sub_mean[:, pix]
-            lin_corrected[s] = mean_lin
+            lin_corrected[s] = all_means[pix]
 
     # ---- Fit the linear PTC model ----------------------------------------
     fit_params = _fit_ptc_line(all_means, all_vars, fit_min_mean_dn, fit_min_var_dn2, fit_max_mean_dn, fit_max_var_dn2)
@@ -366,11 +367,12 @@ def compute_ptc(
     )
     _plot_raw_ptc(bias_sub_mean, per_read_std, all_means, all_vars, fit_params, plot_max_mean_dn)
 
-    _plot_linearisation(result,
-                        f_inv,
-                        fit_min_mean_dn,
-                        fit_max_mean_dn,
-                        save_path)
+    if correct_nonlinearity:
+        _plot_linearisation(result,
+                            f_inv,
+                            fit_min_mean_dn,
+                            fit_max_mean_dn,
+                            save_path)
 
     return result
 
