@@ -121,8 +121,9 @@ def _build_linearity_corrector(
         Forward polynomial: poly(linear_signal) → observed_DN.
     """
     in_range = np.where((observed_mean < fit_max_mean_dn) & (observed_mean > fit_min_mean_dn))[0]
+
     if len(in_range)<2:
-        raise Warning('You excluded too many points from the linearity fit.')
+        raise ValueError('You excluded too many points from the linearity fit.')
     
     weights = 1.0 / np.clip(observed_std[in_range], 1e-6, None)  # avoid /0
     poly = Polynomial.fit(expected_signal[in_range], observed_mean[in_range], deg=poly_degree, w=weights)
@@ -274,24 +275,58 @@ def compute_ptc(
 
     n_exposures, n_reads, n_pixels = images.shape
 
+    # ----  create reset (aka bias) subtracted images -----------
+    mean_bias             = images.mean(axis=0)[0,:]             # (n_pixels,)
+    images_bias_corrected = images - mean_bias
+
+    # ----  correct flux rate over exposures to be the same on average over ROI -----------
+    images_corrected = np.zeros_like(images_bias_corrected)
+
+    # get target linear fit for making all slopes look like this
+    target_ramp = images_bias_corrected.mean(axis=2)[0]
+    x_reads     = np.arange(n_reads)
+    in_range = np.where((target_ramp < fit_max_mean_dn) & (target_ramp > fit_min_mean_dn))[0]
+    mm, bb = np.polyfit(x_reads[in_range], target_ramp[in_range], deg=1)
+    target_linefit = np.arange(n_reads) * mm + bb
+
+    plt.figure()
+    plt.plot(x_reads[in_range], target_ramp[in_range], 'ro')
+    plt.plot(target_linefit,'r--')
+
+    # run through exposures and find their line and fit accordingly
+    for iexp in np.arange(n_exposures):
+        # compute flux rate in an exposure compared to average
+        ramp_for_exposure = images_bias_corrected.mean(axis=2)[iexp]
+        mm, bb = np.polyfit(x_reads[in_range], ramp_for_exposure[in_range], deg=1)
+        exposure_linefit = np.arange(n_reads) * mm + bb
+
+        images_bias_corrected[iexp] *= target_linefit[:, np.newaxis] / exposure_linefit[:, np.newaxis] 
+    
+    plt.plot(np.arange(n_reads),ramp_for_exposure, 'ko')
+    plt.plot(exposure_linefit,'k--')
+
+
     # ---- Per-pixel summary statistics across exposures -------------------
     # mean[read, pixel]  and  std[read, pixel]
-    per_read_mean = images.mean(axis=0)   # (n_reads, n_pixels)
-    per_read_std  = images.std(axis=0)    # (n_reads, n_pixels)
+    per_read_mean = images_bias_corrected.mean(axis=0)   # (n_reads, n_pixels)
+    per_read_std  = images_bias_corrected.std(axis=0)    # (n_reads, n_pixels)
+
 
     # ---- Build the expected-linear-signal model for each pixel -----------
     #   bias  : average DN at the zeroth read (one value per pixel)
     #   flux  : mean DN deposited between read 1 and read 2 (proxy for rate)
     #   linear_model[read, pixel] = read_index x flux_rate
-    bias         = per_read_mean[0, :]                        # (n_pixels,)
+    flux_rate_reset    = per_read_mean[1, :] - per_read_mean[0, :]  # (n_pixels,) , reset to first read sometimes has higher jump
     flux_rate    = per_read_mean[2, :] - per_read_mean[1, :]  # (n_pixels,)
+    reset_jump   = flux_rate_reset - flux_rate                # (n_pixels,)
     read_index   = np.arange(n_reads)                         # (n_reads,)
-    linear_model = read_index[:, np.newaxis] * flux_rate[np.newaxis, :]
+    linear_model = read_index[:, np.newaxis] * flux_rate[np.newaxis, :] + reset_jump
     # (n_reads, n_pixels)
 
-    # Bias-subtracted observed mean for fitting the non-linearity polynomial
-    bias_sub_mean = per_read_mean - bias[np.newaxis, :]  # (n_reads, n_pixels)
-
+    plt.figure()
+    plt.plot(per_read_mean[:,0])
+    plt.plot(linear_model[:,0],'--')
+ 
     # ---- Linearity correction and PTC point collection -------------------
     all_means = np.empty((n_pixels, n_reads))
     all_vars  = np.empty((n_pixels, n_reads))
@@ -305,31 +340,36 @@ def compute_ptc(
     lin_corrected = np.empty((n_sample, n_reads))  # corrected mean
 
     for pix in range(n_pixels):
-        raw_stack = images[:, :, pix]          # (n_exposures, n_reads)
-        bias_corrected = raw_stack - bias[pix] # subtract mean bias
-
         if correct_nonlinearity: 
-            f_inv, poly = _build_linearity_corrector(
-                expected_signal = linear_model[:, pix],
-                observed_mean   = bias_sub_mean[:, pix],
-                observed_std    = per_read_std[:, pix],
-                fit_min_mean_dn = fit_min_mean_dn,
-                fit_max_mean_dn = fit_max_mean_dn,
-                poly_degree     = poly_degree,
-        )
-            linearised = f_inv(bias_corrected)           # apply non-linearity remapping
-            all_means[pix]  = linearised.mean(axis=0)
-            all_vars[pix]   = linearised.std(axis=0) ** 2
+            try:
+                f_inv, poly = _build_linearity_corrector(
+                    expected_signal = linear_model[:, pix],
+                    observed_mean   = per_read_mean[:, pix],
+                    observed_std    = per_read_std[:, pix],
+                    fit_min_mean_dn = fit_min_mean_dn,
+                    fit_max_mean_dn = fit_max_mean_dn,
+                    poly_degree     = poly_degree,
+                    )
+                # apply non-linearity remapping
+                linearised = f_inv(images_bias_corrected[:, :, pix])           # (n_exposures, n_reads) 
+                # compute mean and vars
+                all_means[pix]  = linearised.mean(axis=0)
+                all_vars[pix]   = linearised.std(axis=0) ** 2
+            except ValueError:
+                print(f'bad pixel at pix {pix}')
+                all_means[pix]  = np.full((n_reads), np.nan)
+                all_vars[pix]   = np.full((n_reads), np.nan)
+
         else:
-            all_means[pix]  = bias_corrected.mean(axis=0) # (npix)
-            all_vars[pix]   = bias_corrected.std(axis=0) ** 2
+            all_means[pix]  = images_bias_corrected[:, :, pix].mean(axis=0) # (npix)
+            all_vars[pix]   = images_bias_corrected[:, :, pix].std(axis=0) ** 2
 
         # Save diagnostics for sampled pixels
         sample_pos = np.where(sample_idx == pix)[0]
         if sample_pos.size:
             s = sample_pos[0]
             lin_expected[s]  = linear_model[:, pix]
-            lin_observed[s]  = bias_sub_mean[:, pix]
+            lin_observed[s]  = per_read_mean[:, pix]
             lin_corrected[s] = all_means[pix]
 
     # ---- Fit the linear PTC model ----------------------------------------
@@ -365,7 +405,7 @@ def compute_ptc(
         title            = title,
         save_path        = save_path,
     )
-    _plot_raw_ptc(bias_sub_mean, per_read_std, all_means, all_vars, fit_params, plot_max_mean_dn)
+    _plot_raw_ptc(per_read_mean, per_read_std, all_means, all_vars, fit_params, plot_max_mean_dn)
 
     if correct_nonlinearity:
         _plot_linearisation(result,
@@ -582,7 +622,7 @@ def _plot_ptc_histogram(
 
 
 def _plot_raw_ptc(
-    bias_sub_mean: np.ndarray,
+    per_read_mean: np.ndarray,
     per_read_std: np.ndarray,
     all_means: np.ndarray,
     all_vars: np.ndarray,
@@ -597,7 +637,7 @@ def _plot_raw_ptc(
     y_line = _ptc_model(fit_params, x_line)
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.scatter(bias_sub_mean.ravel(), per_read_std.ravel() ** 2,
+    ax.scatter(per_read_mean.ravel(), per_read_std.ravel() ** 2,
                s=4, alpha=0.3, color="steelblue", label="Raw data")
     ax.scatter(all_means.ravel(), all_vars.ravel(),
                s=2, alpha=0.2, color="m", label="Linearized data")
